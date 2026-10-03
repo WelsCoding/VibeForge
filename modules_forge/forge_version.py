@@ -1,2 +1,2 @@
-version = "neo"
-release = "2.29.2"
+version = "vibe"
+release = "0.1"
