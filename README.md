@@ -29,6 +29,8 @@ The name "Forge" is inspired by "Minecraft Forge". This project aims to become t
 
 - [X] Support [Krea 2](https://huggingface.co/krea/Krea-2-Turbo)
     - `Turbo` / `Raw`
+    - Native prompt weighting in the positive prompt: `(blue sky:3)`, `(clouds:-2)`
+    - Krea-specific; weighted concepts should be entered in the positive prompt (Turbo does not use CFG negatives)
 - [X] Support **Krea 2 Identity Edit**
     - require specific [LoRA](https://civitai.com/models/2761113/krea-2-identity-edit)
     - enable in **Settings/Stable Diffusion**

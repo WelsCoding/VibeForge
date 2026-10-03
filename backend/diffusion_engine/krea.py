@@ -57,7 +57,7 @@ class Krea2(ForgeDiffusionEngine):
             else:
                 dynamic_args.ref_latents.clear()
 
-        return self.text_processing_engine_qwen(prompt)
+        return self.text_processing_engine_qwen(prompt, apply_prompt_weights=not getattr(prompt, "is_negative_prompt", False))
 
     @torch.inference_mode()
     def get_learned_conditioning_with_image(self, prompt: list[str], images: list[torch.Tensor]):
@@ -68,7 +68,7 @@ class Krea2(ForgeDiffusionEngine):
             ref_latents.append(r.squeeze(2))
 
         dynamic_args.ref_latents = ref_latents.copy()
-        return self.text_processing_engine_qwen(prompt, images=images_vl)
+        return self.text_processing_engine_qwen(prompt, images=images_vl, apply_prompt_weights=not getattr(prompt, "is_negative_prompt", False))
 
     @torch.inference_mode()
     def encode_vision(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
