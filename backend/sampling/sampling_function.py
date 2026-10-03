@@ -14,6 +14,7 @@ import torch
 
 from backend import memory_management, utils
 from backend.args import args, dynamic_args
+from backend.krea2 import KREA2_HAS_ATTENTION_BIAS, KREA2_TOKEN_WEIGHTS
 from backend.sampling.condition import (
     Condition,
     compile_conditions,
@@ -249,6 +250,13 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
                         cur_patches[p] = patches[p]
             else:
                 transformer_options["patches"] = patches
+
+        transformer_options.pop(KREA2_TOKEN_WEIGHTS, None)
+        transformer_options.pop(KREA2_HAS_ATTENTION_BIAS, None)
+        if (token_weights := c.pop(KREA2_TOKEN_WEIGHTS, None)) is not None:
+            transformer_options[KREA2_TOKEN_WEIGHTS] = token_weights
+        if c.pop(KREA2_HAS_ATTENTION_BIAS, False):
+            transformer_options[KREA2_HAS_ATTENTION_BIAS] = True
 
         transformer_options["cond_or_uncond"] = cond_or_uncond[:]
         transformer_options["sigmas"] = timestep

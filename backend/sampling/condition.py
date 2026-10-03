@@ -2,6 +2,8 @@ import math
 
 import torch
 
+from backend.krea2 import KREA2_HAS_ATTENTION_BIAS, KREA2_TOKEN_WEIGHTS
+
 
 def repeat_to_batch_size(tensor, batch_size):
     if tensor.shape[0] > batch_size:
@@ -73,6 +75,23 @@ class ConditionCrossAttn(Condition):
         return torch.cat(out)
 
 
+class ConditionKrea2TokenWeights(ConditionCrossAttn):
+    """Per-token Krea 2 weights follow the same batching rules as their text conditioning."""
+
+
+class ConditionKrea2HasAttentionBias(Condition):
+    """A batch-wide flag indicating whether Krea 2 needs additive attention bias."""
+
+    def process_cond(self, batch_size, device, **kwargs):
+        return self
+
+    def can_concat(self, other):
+        return True
+
+    def concat(self, others):
+        return any(bool(condition.cond.any().item()) for condition in [self, *others])
+
+
 class ConditionConstant(Condition):
     def __init__(self, cond):
         self.cond = cond
@@ -105,12 +124,22 @@ def compile_conditions(cond):
         ]
 
     cross_attn = cond["crossattn"]
-    pooled_output = cond["vector"]
+    model_conds = {"c_crossattn": ConditionCrossAttn(cross_attn)}
+    result = dict(cross_attn=cross_attn, model_conds=model_conds)
 
-    result = dict(cross_attn=cross_attn, pooled_output=pooled_output, model_conds=dict(c_crossattn=ConditionCrossAttn(cross_attn), y=Condition(pooled_output)))
+    if "vector" in cond:
+        pooled_output = cond["vector"]
+        result["pooled_output"] = pooled_output
+        model_conds["y"] = Condition(pooled_output)
+
+    if KREA2_TOKEN_WEIGHTS in cond:
+        model_conds[KREA2_TOKEN_WEIGHTS] = ConditionKrea2TokenWeights(cond[KREA2_TOKEN_WEIGHTS])
+
+    if KREA2_HAS_ATTENTION_BIAS in cond:
+        model_conds[KREA2_HAS_ATTENTION_BIAS] = ConditionKrea2HasAttentionBias(cond[KREA2_HAS_ATTENTION_BIAS])
 
     if "guidance" in cond:
-        result["model_conds"]["guidance"] = Condition(cond["guidance"])
+        model_conds["guidance"] = Condition(cond["guidance"])
 
     return [
         result,

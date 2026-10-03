@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from backend.args import dynamic_args
-from backend.attention import attention_function
+from backend.attention import attention_function, attention_pytorch
+from backend.krea2 import KREA2_HAS_ATTENTION_BIAS, KREA2_TOKEN_WEIGHTS
 from backend.memory_management import cast_to
 from backend.misc.image_resize import adaptive_resize
 from backend.nn.flux import EmbedND, timestep_embedding
@@ -77,11 +78,22 @@ class Attention(nn.Module):
         self.qknorm = QKNorm(self.headdim)
         self.wo = nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, x, freqs=None, mask=None, transformer_options={}):
+    def forward(self, x, freqs=None, mask=None, transformer_options={}, token_weights=None, has_attention_bias=False):
         q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
         q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
         k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
         v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
+
+        attention_mask = mask
+        if token_weights is not None:
+            # Krea weights below 1 scale token values; weights above 1 add a key-logit bias.
+            if token_weights.shape[0] != v.shape[0] or token_weights.shape[1] != v.shape[2] or token_weights.shape[2] != 2:
+                raise ValueError(f"Krea 2 token weights have shape {tuple(token_weights.shape)}, expected ({v.shape[0]}, {v.shape[2]}, 2)")
+
+            token_weights = token_weights.to(device=v.device)
+            value_scale = token_weights[..., 0].to(dtype=v.dtype)[:, None, :, None]
+            v = v * value_scale
+
         q, k = self.qknorm(q, k)
         if freqs is not None:
             q, k = ck.apply_rope(q, k, freqs)
@@ -89,7 +101,29 @@ class Attention(nn.Module):
             rep = self.heads // self.kvheads
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-        out = attention_function(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
+
+        if token_weights is not None and has_attention_bias:
+            token_bias = token_weights[..., 1].to(device=q.device, dtype=q.dtype)[:, None, None, :]
+            if attention_mask is not None:
+                if attention_mask.ndim == 2:
+                    if attention_mask.shape == (q.shape[0], k.shape[2]):
+                        attention_mask = attention_mask[:, None, None, :]
+                    else:
+                        attention_mask = attention_mask[None, None, :, :]
+                elif attention_mask.ndim == 3:
+                    attention_mask = attention_mask[:, None, :, :]
+
+                if attention_mask.dtype == torch.bool:
+                    token_bias = token_bias.masked_fill(~attention_mask, torch.finfo(q.dtype).min)
+                else:
+                    token_bias = token_bias + attention_mask.to(dtype=token_bias.dtype)
+
+            # The key bias is additive before softmax, so use SDPA directly rather than a
+            # backend that may not support a per-token additive mask.
+            out = attention_pytorch(q, k, v, self.heads, mask=token_bias, skip_reshape=True)
+        else:
+            out = attention_function(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+
         return self.wo(out * F.sigmoid(gate))
 
 
@@ -161,9 +195,19 @@ class SingleStreamBlock(nn.Module):
         self.attn = Attention(features, heads, kvheads=kvheads, bias=bias)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x, vec, freqs, mask=None, transformer_options={}):
+    def forward(self, x, vec, freqs, mask=None, transformer_options={}, token_weights=None, has_attention_bias=False):
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x.addcmul_(pregate, self.attn(torch.addcmul(preshift, 1 + prescale, self.prenorm(x)), freqs, mask, transformer_options=transformer_options))
+        x.addcmul_(
+            pregate,
+            self.attn(
+                torch.addcmul(preshift, 1 + prescale, self.prenorm(x)),
+                freqs,
+                mask,
+                transformer_options=transformer_options,
+                token_weights=token_weights,
+                has_attention_bias=has_attention_bias,
+            ),
+        )
         x.addcmul_(postgate, self.mlp(torch.addcmul(postshift, 1 + postscale, self.postnorm(x))))
         return x
 
@@ -278,6 +322,19 @@ class SingleStreamDiT(nn.Module):
             reflen = 0
             combined = torch.cat((context, img), dim=1)
 
+        token_weights = transformer_options.get(KREA2_TOKEN_WEIGHTS)
+        has_attention_bias = transformer_options.get(KREA2_HAS_ATTENTION_BIAS, False)
+        if token_weights is not None:
+            if token_weights.ndim != 3 or token_weights.shape[0] != bs or token_weights.shape[1] != txtlen or token_weights.shape[2] != 2:
+                raise ValueError(f"Krea 2 prompt weights have shape {tuple(token_weights.shape)}, expected ({bs}, {txtlen}, 2)")
+
+            token_weights = token_weights.to(device=context.device, dtype=torch.float32)
+            non_text_length = combined.shape[1] - txtlen
+            if non_text_length > 0:
+                neutral_weights = torch.zeros((bs, non_text_length, 2), device=context.device, dtype=token_weights.dtype)
+                neutral_weights[..., 0] = 1.0
+                token_weights = torch.cat((token_weights, neutral_weights), dim=1)
+
         device = combined.device
         txtpos = torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)
 
@@ -295,7 +352,15 @@ class SingleStreamDiT(nn.Module):
         freqs = self.pe_embedder(pos)
 
         for block in self.blocks:
-            combined = block(combined, tvec, freqs, None, transformer_options=transformer_options)
+            combined = block(
+                combined,
+                tvec,
+                freqs,
+                None,
+                transformer_options=transformer_options,
+                token_weights=token_weights,
+                has_attention_bias=has_attention_bias,
+            )
 
         final = self.last(combined, t)
         out = final[:, txtlen + reflen : txtlen + reflen + imglen, :]
