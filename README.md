@@ -1,5 +1,8 @@
 <h1 align="center">Stable Diffusion WebUI Forge - Neo</h1>
 
+03.10.2026 Add native Krea2 Prompt Weight
+
+
 <p align="center"><sup>
 [ <b>Neo</b> | <a href="https://github.com/Haoming02/sd-webui-forge-classic/tree/classic#stable-diffusion-webui-forge---classic">Classic</a> ]
 </sup></p>
